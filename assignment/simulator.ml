@@ -172,9 +172,9 @@ let interp_imm (i:imm) : int64 =
 
 
 
-let write_to_mem (mem:mem) (i:int) (n:int64) : unit = 
+let write_to_mem (mem:mem) (i:int) (n:int64) (step:int) : unit = 
   let byte_list = (sbytes_of_int64 n) in
-    for k = 0 to 7 do
+    for k = 0 to step do
       mem.(i+k) <- List.nth byte_list k
     done
 
@@ -199,12 +199,16 @@ let set_dest (opd:operand) (regs:regs) (mem:mem) (src:int64) : unit =
     | Imm i -> () (* invalid destination *)
     | Ind1 i -> () (* invalid destination *)
     | Reg r -> regs.(rind r) <- src 
-    | Ind2 r -> write_to_mem mem (Option.get (map_addr regs.(rind r))) src
-    | Ind3 (i, r) -> write_to_mem mem ((Int64.to_int (interp_imm i)) + (Option.get (map_addr regs.(rind r)))) src
+    | Ind2 r -> write_to_mem mem (Option.get (map_addr regs.(rind r))) src 7
+    | Ind3 (i, r) -> write_to_mem mem ((Int64.to_int (interp_imm i)) + (Option.get (map_addr regs.(rind r)))) src 7
   end
 
 (* sign helper *)
 let sign64 (n:int64) : bool = if n < Int64.zero then false else true
+
+let set_zf_sf (n:int64) (m:mach) : unit =  
+  m.flags.fz <- (n = Int64.zero);
+  m.flags.fs <- (not (sign64 n))
 
 (* HELPERS for step *)
 
@@ -221,14 +225,13 @@ let interp_negq (opl:operand list) (m:mach) : unit =
   let src = interp_src_operand (List.hd opl) m.regs m.mem in
     let set_fo = if src = Int64.min_int then m.flags.fo <- true else m.flags.fo <- false in
     set_fo;
+    set_zf_sf (Int64.neg src) m;
     set_dest (List.hd opl) m.regs m.mem (Int64.neg src)
 
 
 
 (* Addq *)
 let interp_addq (opl:operand list) (m:mach) : unit = 
-  print_endline @@ string_of_operand (List.hd opl);
-  print_endline @@ string_of_operand (List.nth opl 1);
   let s64 = interp_src_operand (List.hd opl) m.regs m.mem in
     let d64 = interp_src_operand (List.nth opl 1) m.regs m.mem in
       let r64 = (Int64.add s64 d64) in
@@ -236,6 +239,7 @@ let interp_addq (opl:operand list) (m:mach) : unit =
                    then m.flags.fo <- true 
                    else m.flags.fo <- false in
         set_fo;
+        set_zf_sf r64 m;
         set_dest (List.nth opl 1) m.regs m.mem r64
         
 (* Subq *)
@@ -249,15 +253,27 @@ let interp_subq (opl:operand list) (m:mach) : unit =
                    then m.flags.fo <- true 
                    else m.flags.fo <- false in
         set_fo;
+        set_zf_sf r64 m;
         set_dest (List.nth opl 1) m.regs m.mem r64
 
-        
+(* returns true if mult a, b will overflow, else false *)
+let mul_overflow (a:int64) (b:int64) : bool = 
+  if a > 0L then
+    if b > 0L then a > (Int64.div Int64.max_int b)
+    else b < (Int64.div Int64.min_int a)
+  else 
+    if b > 0L then a < (Int64.div Int64.min_int b)
+    else a <> 0L && b < (Int64.div Int64.max_int a)
+
+    
+
 (* Imulq *)
-let interp_imulq (opl:operand list) (m:mach) : unit = 
+let interp_imulq (opl:operand list) (m:mach) : unit =
   let s64 = interp_src_operand (List.hd opl) m.regs m.mem in
     let d64 = interp_src_operand (List.nth opl 1) m.regs m.mem in
       let r64 = (Int64.mul d64 s64) in
-        (* TODO: set of flag *)
+        m.flags.fo <- mul_overflow s64 d64;
+        set_zf_sf r64 m;
         set_dest (List.nth opl 1) m.regs m.mem r64
         
 
@@ -269,6 +285,7 @@ let interp_incq (opl:operand list) (m:mach) : unit =
                    then m.flags.fo <- true 
                    else m.flags.fo <- false in
         set_fo;
+        set_zf_sf r64 m;
         set_dest (List.nth opl 1) m.regs m.mem r64
 
 (* Decq *)
@@ -281,20 +298,152 @@ let interp_decq (opl:operand list) (m:mach) : unit =
                    then m.flags.fo <- true 
                    else m.flags.fo <- false in
         set_fo;
+        set_zf_sf r64 m;
         set_dest (List.nth opl 1) m.regs m.mem r64
 
 (* DATA MOVEMENT *)      
 
 (* Leaq *)
+let interp_leaq (opl:operand list) (m:mach) : unit = 
+  let src = begin match (List.hd opl) with
+                | Ind1 i -> interp_imm i
+                | Ind2 r -> m.regs.(rind r)
+                | Ind3 (i, r) -> ((Int64.add (interp_imm i)) m.regs.(rind r))
+                | _ -> 0L(* should not happen *)
+            end in
+    set_dest (List.nth opl 1) m.regs m.mem src
+
 
 (* Movq *)
 let interp_movq (opl:operand list) (m:mach) : unit = 
   let src = interp_src_operand (List.hd opl) m.regs m.mem in
-    print_endline @@ string_of_operand (List.hd opl);
+  (*print_endline @@ Int64.to_string src;*)
     set_dest (List.nth opl 1) m.regs m.mem src
 
-    
+(* Pushq *)
+let interp_pushq (opl:operand list) (m:mach) : unit = 
+  let src_val = interp_src_operand (List.hd opl) m.regs m.mem in
+    m.regs.(rind Rsp) <- (Int64.sub m.regs.(rind Rsp) 8L);
+    set_dest (Ind2 Rsp) m.regs m.mem src_val
 
+(* Popq *)
+let interp_popq (opl:operand list) (m:mach) : unit = 
+  let src_val = interp_src_operand (Ind2 Rsp) m.regs m.mem in
+    m.regs.(rind Rsp) <- (Int64.add m.regs.(rind Rsp) 8L);
+    set_dest (List.hd opl) m.regs m.mem src_val
+
+
+(* LOGIC INSTR *)
+
+(* fo is always set to 0 *)
+let binary_logic_template (opl:operand list) (m:mach) (f:int64->int64->int64) : unit = 
+  let s64 = interp_src_operand (List.hd opl) m.regs m.mem in
+    let d64 = interp_src_operand (List.nth opl 1) m.regs m.mem in
+        let r64 = (f s64 d64) in
+          let set_fo = m.flags.fo <- false in
+            set_fo;
+            set_zf_sf r64 m;
+            set_dest (List.nth opl 1) m.regs m.mem r64
+
+let interp_andq (opl:operand list) (m:mach) : unit = 
+        binary_logic_template opl m Int64.logand
+
+
+let interp_orq (opl:operand list) (m:mach) : unit = 
+        binary_logic_template opl m Int64.logor
+
+let interp_xorq (opl:operand list) (m:mach) : unit = 
+        binary_logic_template opl m Int64.logxor
+
+let interp_notq (opl:operand list) (m:mach) : unit = 
+  let s64 = interp_src_operand (List.hd opl) m.regs m.mem in
+    set_dest (List.nth opl 1) m.regs m.mem (Int64.lognot s64)
+
+
+(* BIT MANIPULATION INSTR *)
+let binary_bit_manipulate_template (opl:operand list) (m:mach) (f:int64->int->int64) (fo_crit: int64 -> bool) : unit = 
+  let amt = Int64.to_int (interp_src_operand (List.hd opl) m.regs m.mem) in
+    let d64 = interp_src_operand (List.nth opl 1) m.regs m.mem in
+        let r64 = (f d64 amt) in
+          let set_flags = 
+            if amt = 0 then () 
+            else set_zf_sf r64 m;
+                 if amt = 1 then m.flags.fo <- fo_crit r64
+                 else () in
+            set_dest (List.nth opl 1) m.regs m.mem r64
+
+(* Sarq *)
+let interp_sarq (opl:operand list) (m:mach) : unit =
+  let fo_crit (n:int64) : bool = false in
+  binary_bit_manipulate_template opl m Int64.shift_right fo_crit
+
+
+let interp_shlq (opl:operand list) (m:mach) : unit =
+  let fo_crit (n:int64) : bool = if (Int64.shift_left n 63) <> (Int64.shift_left n 62) then true else false in
+  binary_bit_manipulate_template opl m Int64.shift_left fo_crit
+
+
+let interp_shrq (opl:operand list) (m:mach) : unit =
+  let fo_crit (n:int64) : bool = (not (sign64 n)) in
+  binary_bit_manipulate_template opl m Int64.shift_right_logical fo_crit
+
+(* helper *)
+let check_cond_code (m:mach) (cc:cnd) (f1:unit) (f2:unit) : unit = 
+ begin match cc with
+     | Eq -> if m.flags.fz then f1 else f2
+     | Neq -> if not m.flags.fz then f1 else f2
+     | Lt -> if m.flags.fs <> m.flags.fo then f1 else f2
+     | Le -> if m.flags.fs <> m.flags.fo || m.flags.fz then f1 else f2
+     | Gt -> if m.flags.fs == m.flags.fo && m.flags.fz then f1 else f2
+     | Ge -> if m.flags.fs == m.flags.fo then f1 else f2
+   end
+
+let interp_setb (cc:cnd) (opl:operand list) (m:mach) : unit = 
+  let dest = List.hd opl in
+  let set_lower_byte (n: int64) : unit = 
+    begin match dest with
+    | Imm i -> () (* invalid destination *)
+    | Ind1 i -> () (* invalid destination *)
+    | Reg r -> m.regs.(rind r) <- Int64.logand m.regs.(rind r) (Int64.add 0xffffffffffffff00L n)
+    | Ind2 r -> write_to_mem m.mem (Option.get (map_addr m.regs.(rind r))) n 0
+    | Ind3 (i, r) -> write_to_mem m.mem ((Int64.to_int (interp_imm i)) + (Option.get (map_addr m.regs.(rind r)))) n 0
+    end in
+    check_cond_code m cc (set_lower_byte 1L) (set_lower_byte 0L)
+
+
+(* CONTROL FLOW AND CONDITION INSTR *)
+
+(* Cmpq *)
+let interp_cmpq (opl:operand list) (m:mach) : unit = 
+   let s64 = interp_src_operand (List.hd opl) m.regs m.mem in
+    let d64 = interp_src_operand (List.nth opl 1) m.regs m.mem in
+      let r64 = (Int64.sub d64 s64) in
+      let set_fo = if ((sign64 (Int64.neg s64)) = (sign64 d64)) && 
+                      ((sign64 r64) <> (sign64 (Int64.neg s64))) || 
+                      s64 = Int64.min_int 
+                   then m.flags.fo <- true 
+                   else m.flags.fo <- false in
+      set_fo;
+      set_zf_sf r64 m
+
+(* Jmp *)
+let interp_jmp (opl:operand list) (m:mach) : unit = 
+  let src = interp_src_operand (List.hd opl) m.regs m.mem in
+    m.regs.(rind Rip) <- src
+
+let interp_callq (opl:operand list) (m:mach) : unit = 
+  let src = interp_src_operand (List.hd opl) m.regs m.mem in
+    interp_pushq [(Reg Rip)] m;
+    set_dest (Reg Rip) m.regs m.mem src
+
+let interp_retq (opl:operand list) (m:mach) : unit = 
+  interp_popq [(Reg Rip)] m
+
+let interp_j (cc:cnd) (opl:operand list) (m:mach) : unit = 
+    let src = interp_src_operand (List.hd opl) m.regs m.mem in
+      let set_rip = set_dest (Reg Rip) m.regs m.mem src in
+        check_cond_code m cc set_rip ()
+          
 (* Simulates one step of the machine:
     - fetch the instruction at %rip
     - compute the source and/or destination information from the operands
@@ -306,6 +455,8 @@ let step (m:mach) : unit =
   let sb = m.mem.(Option.get (map_addr (m.regs.(rind Rip)))) in 
     begin match sb with
     | InsB0 (opc, opl) -> (* case that at mem(rip) is actually an instruction *)
+        (*print_endline @@ "new instruction: ";
+        print_endline @@ string_of_ins (opc, opl); *)
         begin match opc with
          | Negq -> interp_negq opl m
          | Addq -> interp_addq opl m
@@ -313,8 +464,26 @@ let step (m:mach) : unit =
          | Subq -> interp_subq opl m
          | Incq -> interp_incq opl m
          | Decq -> interp_decq opl m
+         | Leaq -> interp_leaq opl m
          | Movq -> interp_movq opl m
-        end
+         | Pushq -> interp_pushq opl m
+         | Popq -> interp_popq opl m
+         | Notq -> interp_notq opl m
+         | Andq -> interp_andq opl m
+         | Orq -> interp_orq opl m
+         | Xorq -> interp_xorq opl m
+         | Cmpq -> interp_cmpq opl m
+         | Jmp -> interp_jmp opl m
+         | Callq -> interp_callq opl m
+         | Retq -> interp_retq opl m
+         | J cc -> interp_j cc opl m
+         | Set cc -> interp_setb cc opl m
+         | Sarq -> interp_sarq opl m
+         | Shlq -> interp_shlq opl m
+         | Shrq -> interp_shrq opl m
+        end;
+        (* increment rip to get next instr *)
+        m.regs.(rind Rip) <- (Int64.add (m.regs.(rind Rip)) 8L)
     | InsFrag -> ()
     | Byte c -> ()
   end

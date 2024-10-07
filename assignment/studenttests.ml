@@ -6,8 +6,11 @@ open Simulator
 (* implementation.                                              *)
 
 
+
 let provided_tests : suite = [
   Test ("Debug", [
+
+    (*print_endline @@ string_of_operand (List.hd opl);*)
   ]);
 
 ] 
